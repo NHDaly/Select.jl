@@ -214,6 +214,7 @@ function select_kill_rivals(tasks, myidx)
 end
 function _select_block_macro(clauses)
     branches = Expr(:block)
+    body_branches = Expr(:block)
     for (i, (clause, body)) in enumerate(clauses)
         if clause.kind == SelectPut
             wait_for_channel = :(wait_put($(clause.channel|>get|>esc)))
@@ -238,21 +239,30 @@ function _select_block_macro(clauses)
                         end
                     end
                     select_kill_rivals(tasks, $i)
-                    $mutate_channel
-                    put!(winner_ch, $(esc(body)))
+                    put!(winner_ch, $i)
                 catch err
                     Base.throwto(maintask, err)
                 end
+            end # if
+        end # for
+        push!(branches.args, branch)
+
+        body_branch = quote
+            if branch_id == $i
+                $mutate_channel
+                return_value = $(esc(body))
             end
         end
-        push!(branches.args, branch)
+        push!(body_branches.args, body_branch)
     end
     quote
         winner_ch = Channel(1)
         tasks = Array(Task, $(length(clauses)))
         maintask = current_task()
-        $branches
-        take!(winner_ch)
+        $branches # set up competing tasks
+        branch_id = take!(winner_ch) # get the id of the winning task
+        $body_branches # execute the winning block in the original lexical context
+        return_value
     end
 end
 # The following methods are the functional (as opposed to macro) forms of
