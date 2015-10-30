@@ -219,9 +219,11 @@ function _select_block_macro(clauses)
         if clause.kind == SelectPut
             wait_for_channel = :(wait_put($(clause.channel|>get|>esc)))
             mutate_channel =  :(put!($(clause.channel|>get|>esc), $(clause.value|>get|>esc)))
+            bind_variable = :(nothing)
         elseif clause.kind == SelectTake
             wait_for_channel =  :(wait($(clause.channel|>get|>esc)))
-            mutate_channel =  :($(clause.value|>get|>esc) = _take!($(clause.channel|>get|>esc)))
+            mutate_channel =  :(_take!($(clause.channel|>get|>esc)))
+            bind_variable = :($(clause.value|>get|>esc) = branch_val)
         end
         branch = quote
             tasks[$i] = @schedule begin
@@ -239,7 +241,8 @@ function _select_block_macro(clauses)
                         end
                     end
                     select_kill_rivals(tasks, $i)
-                    put!(winner_ch, $i)
+                    event_val = $mutate_channel
+                    put!(winner_ch, ($i, event_val))
                 catch err
                     Base.throwto(maintask, err)
                 end
@@ -247,22 +250,18 @@ function _select_block_macro(clauses)
         end # for
         push!(branches.args, branch)
 
-        body_branch = quote
-            if branch_id == $i
-                $mutate_channel
-                return_value = $(esc(body))
-            end
-        end
-        push!(body_branches.args, body_branch)
+        body_branch = :(if branch_id == $i; $bind_variable; $(esc(body)); end)
+        # the next two lines build an if / elseif chain
+        push!(body_branch.args, body_branches)
+        body_branches = body_branch
     end
     quote
         winner_ch = Channel(1)
         tasks = Array(Task, $(length(clauses)))
         maintask = current_task()
         $branches # set up competing tasks
-        branch_id = take!(winner_ch) # get the id of the winning task
+        (branch_id, branch_val) = take!(winner_ch) # get the id of the winning task
         $body_branches # execute the winning block in the original lexical context
-        return_value
     end
 end
 # The following methods are the functional (as opposed to macro) forms of
