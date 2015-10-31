@@ -149,43 +149,47 @@ _take!(x) = wait(x)
 # since "wait" is level-triggered.
 _isready(c::AbstractChannel) = isready(c)
 _isready(t::Task) = istaskdone(t)
+
+# helper function to place the default case in the proper position
+function set_default_first!(clauses)
+    default_pos = find(clauses) do x
+        clause, body = x
+        clause.kind == SelectDefault
+    end
+    l = length(default_pos)
+    l == 0 && return # bail out if there is no default case
+    l  > 1 && throw(ErrorException("Select takes at most one default case. Found: $l"))
+    # swap elements to sure make SelectDefault comes first
+    clauses[1], clauses[default_pos[1]] = clauses[default_pos[1]], clauses[1]
+    clauses
+end
+
 function _select_nonblock_macro(clauses)
+    set_default_first!(clauses)
     branches = Expr(:block)
     for (clause, body) in clauses
-        local branch
+        branch =
         if clause.kind == SelectPut
-            branch = quote
-                if isready_put($(clause.channel|>get|>esc))
-                    put!($(clause.channel|>get|>esc), $(clause.value|>get|>esc))
-                    ret = $(esc(body))
-                    break
-                end
-            end
+            :(if isready_put($(clause.channel|>get|>esc))
+                put!($(clause.channel|>get|>esc), $(clause.value|>get|>esc))
+                $(esc(body))
+            end)
         elseif clause.kind == SelectTake
-            branch = quote
-                if _isready($(clause.channel|>get|>esc))
-                    $(clause.value|>get|>esc) =
-                    _take!($(clause.channel|>get|>esc))
-                    ret = $(esc(body))
-                    break
-                end
-            end
+            :(if _isready($(clause.channel|>get|>esc))
+                $(clause.value|>get|>esc) = _take!($(clause.channel|>get|>esc))
+                $(esc(body))
+            end)
         elseif clause.kind == SelectDefault
-            branch = quote
-                ret = $(esc(body))
-                break
-            end
+            :($(esc(body)))
         end
-        push!(branches.args, branch)
+
+        # the next two lines build an if / elseif chain from the bottom up
+        push!(branch.args, branches)
+        branches = branch
     end
-    quote
-        local ret
-        while true
-            $branches
-        end
-        ret
-    end
+    :($branches)
 end
+
 # The strategy for blocking select statements is to create a set of "rival"
 # tasks, one per condition. When a rival "wins" by having its conditional be
 # the first available, it sends a special interrupt to its rivals to kill them.
@@ -251,7 +255,7 @@ function _select_block_macro(clauses)
         push!(branches.args, branch)
 
         body_branch = :(if branch_id == $i; $bind_variable; $(esc(body)); end)
-        # the next two lines build an if / elseif chain
+        # the next two lines build an if / elseif chain from the bottom up
         push!(body_branch.args, body_branches)
         body_branches = body_branch
     end
