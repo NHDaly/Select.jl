@@ -8,22 +8,22 @@ function select_block_test(t1, t2, t3, t4)
 
     put!(c3,1)
 
-    @schedule begin
+    @async begin
         sleep(t1)
         put!(c1,:a)
     end
 
-    @schedule begin
+    @async begin
         sleep(t2)
         put!(c2,1)
     end
 
-    @schedule begin
+    @async begin
         sleep(t3)
         take!(c3)
     end
 
-    task = @schedule begin
+    task = @async begin
         sleep(t4)
         :task_done
     end

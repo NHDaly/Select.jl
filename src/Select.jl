@@ -1,5 +1,7 @@
 module Select
 
+using Nullables
+
 export @select
 
 function isready_put(c::Channel)
@@ -30,7 +32,7 @@ end
 #    println(value)
 # ...
 # end
-immutable SelectClause{ChannelT, ValueT}
+struct SelectClause{ChannelT, ValueT}
     kind::SelectClauseKind
     channel::Nullable{ChannelT}
     value::Nullable{ValueT}
@@ -116,14 +118,14 @@ macro select(expr)
         # skip line nodes
         isa(se, Expr) || continue
         # grab all the pairs
-        if se.head == :(=>)
-            if se.args[1] != :_
-                push!(clauses, (parse_select_clause(se.args[1]), se.args[2]))
+        if se.head == :call && se.args[1] == :(=>)
+            if se.args[2] != :_
+                push!(clauses, (parse_select_clause(se.args[2]), se.args[3]))
             else
                 # The defaule case (_). If present, the select
                 # statement is considered non-blocking and will return this
                 # section if none of the other conditions are immediately available.
-                push!(clauses, (SelectClause(SelectDefault, Nullable(), Nullable()), se.args[2]))
+                push!(clauses, (SelectClause(SelectDefault, Nullable(), Nullable()), se.args[3]))
                 mode = :nonblocking
             end
         elseif se.head != :block && se.head != :line
@@ -195,7 +197,7 @@ end
 # the first available, it sends a special interrupt to its rivals to kill them.
 # The interrupt includes the task where control should be resumed
 # once the rival has shut itself down.
-immutable SelectInterrupt <: Exception
+struct SelectInterrupt <: Exception
     parent::Task
 end
 # Kill all tasks in "tasks" besides  a given task. Used for killing the rivals
@@ -230,7 +232,7 @@ function _select_block_macro(clauses)
             bind_variable = :($(clause.value|>get|>esc) = branch_val)
         end
         branch = quote
-            tasks[$i] = @schedule begin
+            tasks[$i] = @async begin
                 try  # Listen for genuine errors to throw to the main task
                     try
                         # Listen for SelectInterrupt messages so we can shutdown
@@ -261,7 +263,7 @@ function _select_block_macro(clauses)
     end
     quote
         winner_ch = Channel(1)
-        tasks = Array(Task, $(length(clauses)))
+        tasks = Array{Task}(undef, $(length(clauses)))
         maintask = current_task()
         $branches # set up competing tasks
         (branch_id, branch_val) = take!(winner_ch) # get the id of the winning task
@@ -288,7 +290,7 @@ function _select_nonblock(clauses)
 end
 function _select_block(clauses)
     winner_ch = Channel{Tuple{Int, Any}}(1)
-    tasks = Array(Task, length(clauses))
+    tasks = Array{Task}(undef, length(clauses))
     maintask = current_task()
     for (i, clause) in enumerate(clauses)
         tasks[i] = @async begin
