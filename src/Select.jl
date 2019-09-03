@@ -12,33 +12,19 @@ function isready_put(c::Channel)
     end
 end
 
-# function wait_and_select_algorithm(c::Channel, isready_func, condition_var, mutate_func, i)
-#     # TODO: Is this sufficiently thread-safe?
-#     isready_put(c) && return
-#     lock(c)
-#     try
-#         while !isready_put(c)
-#             Base.check_channel_state(c)
-#             wait(c.cond_put)  # Can be cancelled while waiting here...
-#         end
-#         # We got the lock, so run this task to completion.
-#         @info "Task $($i) woke: killing rivals"
-#         select_kill_rivals(tasks, i)
-#         event_val = $mutate_channel
-#         put!(winner_ch, ($i, event_val))
-#     catch err
-#         @info "CAUGHT SelectInterrupt: $err"
-#         if isa(err, SelectInterrupt)
-#             yieldto(err.parent)  # TODO: is this still a thing we should do?
-#             return
-#         else
-#             rethrow()
-#         end
-#     finally
-#         unlock(c)
-#     end
-#     nothing
-# end
+function wait_put(c::Channel)
+    # TODO: Is this sufficiently thread-safe?
+    lock(c)
+    try
+        while !isready_put(c)
+            Base.check_channel_state(c)
+            wait(c.cond_put)  # Can be cancelled while waiting here...
+        end
+    finally
+        unlock(c)
+    end
+    nothing
+end
 
 
 ## Implementation of 'select' mechanism to block on the disjunction of
@@ -252,10 +238,10 @@ end
 function _select_block_macro(clauses)
     branches = Expr(:block)
     body_branches = Expr(:block)
+    clause_lock = gensym("clause_lock")
+    lock_assignment_expr = :($clause_lock = Base.ReentrantLock())
     for (i, (clause, body)) in enumerate(clauses)
         channel_var = gensym("channel")
-        clause_lock = gensym("clause_lock")
-        lock_assignment_expr = :($clause_lock = Base.ReentrantLock())
         value_var = clause.value|>get|>esc
         channel_declaration_expr = :(local $channel_var)
         channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
@@ -265,6 +251,7 @@ function _select_block_macro(clauses)
             mutate_channel =  :(put!($channel_var, $value_var))
             bind_variable = :(nothing)
         elseif clause.kind == SelectTake
+            isready_func = _isready
             wait_for_channel =  :(wait($channel_var))
             mutate_channel =  :(_take!($channel_var))
             bind_variable = :($value_var = branch_val)
@@ -272,7 +259,6 @@ function _select_block_macro(clauses)
         branch = quote
             tasks[$i] = @async begin
                 $channel_declaration_expr
-                $lock_assignment_expr
                 try  # Listen for genuine errors to throw to the main task
                     $channel_assignment_expr
 
@@ -281,27 +267,60 @@ function _select_block_macro(clauses)
                     # Listen for SelectInterrupt messages so we can shutdown
                     # if a rival's channel unblocks first.
                     try
-                        #@info "Task $($i) about to wait"
-                        $wait_for_channel
-                        # NOTE: This is _not a deadock_ because there is a global ordering
-                        # to the locks: we _ALWAYS_ wait on the channel before waiting on
-                        # the clause_lock. This invariant must not be violated.
-                        #@info "Task $($i) about to lock"
-                        try
+                        # AHA: This needs to be an outer loop, because of the gap....
+                        # TODO: Describe this better
+                        while true
+                            @info "Task $($i) about to wait"
+                            $wait_for_channel
+
+                            # TODO: Because of this gap, where no locks are held, it's possible
+                            # that multiple tasks can be woken-up due to a `put!` or `take!` on
+                            # a channel they were waiting for. Only once will proceed in this
+                            # @select, but a channel running _outside this macro_ may yet proceed
+                            # and cause a problem.. I think this is bad. Fix this (probably) by
+                            # returning the lock to unlock from `wait_for_channel`.
+
+                            # NOTE: This is _not a deadock_ because there is a global ordering
+                            # to the locks: we _ALWAYS_ wait on the channel before waiting on
+                            # the clause_lock. This invariant must not be violated.
+                            @info "Task $($i) about to lock"
                             lock($clause_lock)
                             # We got the lock, so run this task to completion.
-                            #@info "Task $($i) woke: killing rivals"
-                            select_kill_rivals(tasks, $i)
-                            event_val = $mutate_channel
-                            #@info "Got event_val: $event_val"
-                            put!(winner_ch, ($i, event_val))
-                        finally
-                            unlock($clause_lock)
+                            try
+                                @info "Task $($i): got lock"
+                                # Here's the thing: If we go the lock because one of our
+                                # siblings woke us up, we need to go back to sleep. Siblings
+                                # don't count. So if we got woken up above but we're actually
+                                # still not ready, we need to let go of this lock, and go back
+                                # to sleep.
+                                @info $isready_func($channel_var)
+                                if !$isready_func($channel_var)
+                                    @info "Task $($i) Not ready; Unlocking"
+                                    continue
+                                end
+                                # This block is atomic, so it _shouldn't_ matter whether we kill
+                                # rivals first or mutate_channel first. It only matters if one
+                                # case is accidentally synchronizing w/ another case, which
+                                # should be specifically prohibited (somehow).
+                                # For now, I'm killing rivals first so that at least we'll get
+                                # an exception, rather than a deadlock, if we end up waiting on
+                                # our rival, sibling cases.
+                                @info "Task $($i): killing rivals"
+                                select_kill_rivals(tasks, $i)
+
+                                @info "Task $($i): mutating"
+                                event_val = $mutate_channel
+                                @info "Got event_val: $event_val"
+                                put!(winner_ch, ($i, event_val))
+                            finally
+                                #@info "Task $($i)) unlock"
+                                unlock($clause_lock)
+                            end
                         end
                     catch err
-                        #@info "CAUGHT SelectInterrupt: $err"
                         if isa(err, SelectInterrupt)
-                            yieldto(err.parent)  # TODO: is this still a thing we should do?
+                            #@info "CAUGHT SelectInterrupt: $err"
+                            #yieldto(err.parent)  # TODO: is this still a thing we should do?
                             return
                         else
                             rethrow()
@@ -323,6 +342,7 @@ function _select_block_macro(clauses)
         winner_ch = Channel(1)
         tasks = Array{Task}(undef, $(length(clauses)))
         maintask = current_task()
+        $lock_assignment_expr
         $branches # set up competing tasks
         (branch_id, branch_val) = take!(winner_ch) # get the id of the winning task
         $body_branches # execute the winning block in the original lexical context

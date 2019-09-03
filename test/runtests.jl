@@ -1,5 +1,14 @@
 using Select
-using Base.Test
+using Test
+
+@testset "self-references" begin
+    ch = Channel()
+    @test Select.@select begin
+        ch <| "hi"          => "put"
+        ch |> x             => "take! |> $x"
+        @async(sleep(1))    => "timeout"
+    end == "timeout"
+end
 
 function select_block_test(t1, t2, t3, t4)
     c1 = Channel{Symbol}(1)
