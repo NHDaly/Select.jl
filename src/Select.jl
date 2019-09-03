@@ -227,10 +227,10 @@ end
 # Kill all tasks in "tasks" besides  a given task. Used for killing the rivals
 # of the winning waiting task.
 function select_kill_rivals(tasks, myidx)
-    @info myidx
+    #@info myidx
     for (taskidx, task) in enumerate(tasks)
         taskidx == myidx && continue
-        @info taskidx, task
+        #@info taskidx, task
         #if task.state == :waiting || task.state == :queued
             # Rival is blocked waiting for its channel; send it a message that it's
             # lost the race.
@@ -244,7 +244,7 @@ function select_kill_rivals(tasks, myidx)
         #     deleteat!(Base.Workqueue, queueidx)
         # end
     end
-    @info "done killing"
+    #@info "done killing"
 end
 function _select_block_macro(clauses)
     branches = Expr(:block)
@@ -276,22 +276,22 @@ function _select_block_macro(clauses)
                     # Listen for SelectInterrupt messages so we can shutdown
                     # if a rival's channel unblocks first.
                     try
-                        @info "Task $($i) about to lock"
+                        #@info "Task $($i) about to lock"
                         lock($wait_condition)
-                        @info "Task $($i) about to wait"
+                        #@info "Task $($i) about to wait"
                         while !$isready_func($channel_var)
-                            @info "Task $($i) waiting"
+                            #@info "Task $($i) waiting"
                             Base.check_channel_state($channel_var)
                             wait($wait_condition)  # Can be cancelled while waiting here...
                         end
                         # We got the lock, so run this task to completion.
-                        @info "Task $($i) woke: killing rivals"
+                        #@info "Task $($i) woke: killing rivals"
                         select_kill_rivals(tasks, $i)
                         event_val = $mutate_channel
-                        @info "Got event_val: $event_val"
+                        #@info "Got event_val: $event_val"
                         put!(winner_ch, ($i, event_val))
                     catch err
-                        @info "CAUGHT SelectInterrupt: $err"
+                        #@info "CAUGHT SelectInterrupt: $err"
                         if isa(err, SelectInterrupt)
                             yieldto(err.parent)  # TODO: is this still a thing we should do?
                             return
