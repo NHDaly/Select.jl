@@ -12,23 +12,33 @@ function isready_put(c::Channel)
     end
 end
 
-function wait_put(c::Channel)
-    # TODO: Is this sufficiently thread-safe?
-    isready_put(c) && return
-    lock(c)
-    try
-        while !isready_put(c)
-            Base.check_channel_state(c)
-            wait(c.cond_put)  # Can be cancelled while waiting here...
-        end
-    catch e
-        @info e
-        rethrow()  # Allow any exceptions to escape (ie SelectInterrupt)
-    finally
-        unlock(c)
-    end
-    nothing
-end
+# function wait_and_select_algorithm(c::Channel, isready_func, condition_var, mutate_func, i)
+#     # TODO: Is this sufficiently thread-safe?
+#     isready_put(c) && return
+#     lock(c)
+#     try
+#         while !isready_put(c)
+#             Base.check_channel_state(c)
+#             wait(c.cond_put)  # Can be cancelled while waiting here...
+#         end
+#         # We got the lock, so run this task to completion.
+#         @info "Task $($i) woke: killing rivals"
+#         select_kill_rivals(tasks, i)
+#         event_val = $mutate_channel
+#         put!(winner_ch, ($i, event_val))
+#     catch err
+#         @info "CAUGHT SelectInterrupt: $err"
+#         if isa(err, SelectInterrupt)
+#             yieldto(err.parent)  # TODO: is this still a thing we should do?
+#             return
+#         else
+#             rethrow()
+#         end
+#     finally
+#         unlock(c)
+#     end
+#     nothing
+# end
 
 
 ## Implementation of 'select' mechanism to block on the disjunction of
@@ -217,9 +227,11 @@ end
 # Kill all tasks in "tasks" besides  a given task. Used for killing the rivals
 # of the winning waiting task.
 function select_kill_rivals(tasks, myidx)
+    #@info myidx
     for (taskidx, task) in enumerate(tasks)
         taskidx == myidx && continue
-        if task.state == :waiting || task.state == :queued
+        #@info taskidx, task
+        #if task.state == :waiting || task.state == :queued
             # Rival is blocked waiting for its channel; send it a message that it's
             # lost the race.
             Base.schedule(task, SelectInterrupt(current_task()), error=true)
@@ -230,8 +242,9 @@ function select_kill_rivals(tasks, myidx)
         #     # Just delete it from the workqueue.
         #     queueidx = findfirst(Base.Workqueue.==task)
         #     deleteat!(Base.Workqueue, queueidx)
-        end
+        # end
     end
+    #@info "done killing"
 end
 function _select_block_macro(clauses)
     branches = Expr(:block)
@@ -242,12 +255,13 @@ function _select_block_macro(clauses)
         channel_declaration_expr = :(local $channel_var)
         channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
         if clause.kind == SelectPut
-            wait_for_channel = :(wait_put($channel_var))
+            isready_func = isready_put
+            wait_condition = :($channel_var.cond_put)
             mutate_channel =  :(put!($channel_var, $value_var))
             bind_variable = :(nothing)
         elseif clause.kind == SelectTake
-            #@assert get(clause.value) isa Symbol "Syntax error: Channel |> variable clause must assign into a simple variable name."
-            wait_for_channel =  :(wait($channel_var))
+            isready_func = Base.isready
+            wait_condition = :($channel_var.cond_wait)
             mutate_channel =  :(_take!($channel_var))
             bind_variable = :($value_var = branch_val)
         end
@@ -255,24 +269,38 @@ function _select_block_macro(clauses)
             tasks[$i] = @async begin
                 $channel_declaration_expr
                 try  # Listen for genuine errors to throw to the main task
+                    $channel_assignment_expr
+
+                    # ---- Begin the actual `wait_and_select` algorithm ----
+                    # TODO: Is this sufficiently thread-safe?
+                    # Listen for SelectInterrupt messages so we can shutdown
+                    # if a rival's channel unblocks first.
                     try
-                        $channel_assignment_expr
-                        # Listen for SelectInterrupt messages so we can shutdown
-                        # if a rival's channel unblocks first.
-                        $wait_for_channel
+                        #@info "Task $($i) about to lock"
+                        lock($wait_condition)
+                        #@info "Task $($i) about to wait"
+                        while !$isready_func($channel_var)
+                            #@info "Task $($i) waiting"
+                            Base.check_channel_state($channel_var)
+                            wait($wait_condition)  # Can be cancelled while waiting here...
+                        end
+                        # We got the lock, so run this task to completion.
+                        #@info "Task $($i) woke: killing rivals"
+                        select_kill_rivals(tasks, $i)
+                        event_val = $mutate_channel
+                        #@info "Got event_val: $event_val"
+                        put!(winner_ch, ($i, event_val))
                     catch err
-                        @info "CAUGHT SelectInterrupt: $err"
+                        #@info "CAUGHT SelectInterrupt: $err"
                         if isa(err, SelectInterrupt)
-                            yieldto(err.parent)
+                            yieldto(err.parent)  # TODO: is this still a thing we should do?
                             return
                         else
                             rethrow()
                         end
+                    finally
+                        unlock($wait_condition)
                     end
-                    @info "Task $($i) woke: killing rivals"
-                    select_kill_rivals(tasks, $i)
-                    event_val = $mutate_channel
-                    put!(winner_ch, ($i, event_val))
                 catch err
                     Base.throwto(maintask, err)
                 end
@@ -317,7 +345,7 @@ function _select_block(clauses)
     tasks = Array{Task}(undef, length(clauses))
     maintask = current_task()
     for (i, clause) in enumerate(clauses)
-        tasks[i] = @async begin
+        tasks[i] = Threads.@spawn begin
             try
                 try
                     if clause[1] == :put
