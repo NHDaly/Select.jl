@@ -68,9 +68,10 @@ function parse_select_clause(clause)
         end
     else
         # Assume this is a 'take' clause whose return value isn't wanted.
-        # To simplify the rest of the code to not have to deal with this special case,
-        # the return value is assigned to a throw-away gensym.
-        SelectClause(SelectTake, Nullable(clause), Nullable(gensym()))
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~To simplify the rest of the code to not have to deal with this special case,
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~the return value is assigned to a throw-away gensym.
+        # TODO: trying setting the value to null when not used
+        SelectClause(SelectTake, Nullable(clause), Nullable())
     end
 end
 
@@ -229,19 +230,30 @@ function _select_block_macro(clauses)
     branches = Expr(:block)
     body_branches = Expr(:block)
     for (i, (clause, body)) in enumerate(clauses)
+        channel_var = gensym("channel")
+        value_var = gensym("value")
+        inputs_declarations_expr = :(local $channel_var)
+        inputs_assignments_expr = :($channel_var = $(clause.channel|>get|>esc))
+        if !isnull(clause.value)
+            inputs_declarations_expr = :($inputs_declarations_expr; local $value_var)
+            inputs_assignments_expr = :($inputs_assignments_expr;
+                                        $value_var = $(clause.value|>get|>esc))
+        end
         if clause.kind == SelectPut
-            wait_for_channel = :(wait_put($(clause.channel|>get|>esc)))
-            mutate_channel =  :(put!($(clause.channel|>get|>esc), $(clause.value|>get|>esc)))
+            wait_for_channel = :(wait_put($channel_var))
+            mutate_channel =  :(put!($channel_var, $value_var))
             bind_variable = :(nothing)
         elseif clause.kind == SelectTake
-            wait_for_channel =  :(wait($(clause.channel|>get|>esc)))
-            mutate_channel =  :(_take!($(clause.channel|>get|>esc)))
-            bind_variable = :($(clause.value|>get|>esc) = branch_val)
+            wait_for_channel =  :(wait($channel_var))
+            mutate_channel =  :(_take!($channel_var))
+            bind_variable = :($value_var = branch_val)
         end
         branch = quote
             tasks[$i] = @async begin
+                $inputs_declarations_expr
                 try  # Listen for genuine errors to throw to the main task
                     try
+                        $inputs_assignments_expr
                         # Listen for SelectInterrupt messages so we can shutdown
                         # if a rival's channel unblocks first.
                         $wait_for_channel
