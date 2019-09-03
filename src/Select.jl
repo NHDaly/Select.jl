@@ -13,25 +13,19 @@ function isready_put(c::Channel)
 end
 
 function wait_put(c::Channel)
-    # TODO: This is definitely not safe in the new threaded world
-    while !isready_put(c)
-        wait(c.cond_put)
+    # TODO: Is this sufficiently thread-safe?
+    isready_put(c) && return
+    lock(c)
+    try
+        while !isready_put(c)
+            Base.check_channel_state(c)
+            wait(c.cond_put)
+        end
+    finally
+        unlock(c)
     end
+    nothing
 end
-
-# function wait(c::Channel)
-#     isready(c) && return
-#     lock(c)
-#     try
-#         while !isready(c)
-#             check_channel_state(c)
-#             wait(c.cond_wait)
-#         end
-#     finally
-#         unlock(c)
-#     end
-#     nothing
-# end
 
 
 ## Implementation of 'select' mechanism to block on the disjunction of
