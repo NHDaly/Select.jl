@@ -257,7 +257,7 @@ function _select_block_macro(clauses)
             bind_variable = :($value_var = branch_val)
         end
         branch = quote
-            tasks[$i] = @async begin
+            tasks[$i] = Threads.@spawn begin
                 $channel_declaration_expr
                 try  # Listen for genuine errors to throw to the main task
                     $channel_assignment_expr
