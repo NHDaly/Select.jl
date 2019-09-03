@@ -19,8 +19,11 @@ function wait_put(c::Channel)
     try
         while !isready_put(c)
             Base.check_channel_state(c)
-            wait(c.cond_put)
+            wait(c.cond_put)  # Can be cancelled while waiting here...
         end
+    catch e
+        @info e
+        rethrow()  # Allow any exceptions to escape (ie SelectInterrupt)
     finally
         unlock(c)
     end
@@ -68,10 +71,9 @@ function parse_select_clause(clause)
         end
     else
         # Assume this is a 'take' clause whose return value isn't wanted.
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~To simplify the rest of the code to not have to deal with this special case,
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~the return value is assigned to a throw-away gensym.
-        # TODO: trying setting the value to null when not used
-        SelectClause(SelectTake, Nullable(clause), Nullable())
+        # To simplify the rest of the code to not have to deal with this special case,
+        # the return value is assigned to a throw-away gensym.
+        SelectClause(SelectTake, Nullable(clause), Nullable(gensym()))
     end
 end
 
@@ -162,7 +164,7 @@ _isready(t::Task) = istaskdone(t)
 
 # helper function to place the default case in the proper position
 function set_default_first!(clauses)
-    default_pos = find(clauses) do x
+    default_pos = findall(clauses) do x
         clause, body = x
         clause.kind == SelectDefault
     end
@@ -180,13 +182,17 @@ function _select_nonblock_macro(clauses)
     for (clause, body) in clauses
         branch =
         if clause.kind == SelectPut
-            :(if isready_put($(clause.channel|>get|>esc))
-                put!($(clause.channel|>get|>esc), $(clause.value|>get|>esc))
+            channel_var = gensym("channel")
+            channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
+            :(if ($channel_assignment_expr; isready_put($channel_var))
+                put!($channel_var, $(clause.value|>get|>esc))
                 $(esc(body))
             end)
         elseif clause.kind == SelectTake
-            :(if _isready($(clause.channel|>get|>esc))
-                $(clause.value|>get|>esc) = _take!($(clause.channel|>get|>esc))
+            channel_var = gensym("channel")
+            channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
+            :(if ($channel_assignment_expr; _isready($channel_var))
+                $(clause.value|>get|>esc) = _take!($channel_var)
                 $(esc(body))
             end)
         elseif clause.kind == SelectDefault
@@ -213,16 +219,17 @@ end
 function select_kill_rivals(tasks, myidx)
     for (taskidx, task) in enumerate(tasks)
         taskidx == myidx && continue
-        if task.state==:waiting
+        if task.state == :waiting || task.state == :queued
             # Rival is blocked waiting for its channel; send it a message that it's
             # lost the race.
-            Base.throwto(task, SelectInterrupt(current_task()))
-        elseif task.state==:queued
-            # Rival hasn't starting running yet and so hasn't blocked or set up
-            # a try-catch block to listen for SelectInterrupt.
-            # Just delete it from the workqueue.
-            queueidx = findfirst(Base.Workqueue.==task)
-            deleteat!(Base.Workqueue, queueidx)
+            Base.schedule(task, SelectInterrupt(current_task()), error=true)
+        # TODO: Is this still a legit optimization?:
+        # elseif task.state==:queued
+        #     # Rival hasn't starting running yet and so hasn't blocked or set up
+        #     # a try-catch block to listen for SelectInterrupt.
+        #     # Just delete it from the workqueue.
+        #     queueidx = findfirst(Base.Workqueue.==task)
+        #     deleteat!(Base.Workqueue, queueidx)
         end
     end
 end
@@ -231,33 +238,30 @@ function _select_block_macro(clauses)
     body_branches = Expr(:block)
     for (i, (clause, body)) in enumerate(clauses)
         channel_var = gensym("channel")
-        value_var = gensym("value")
-        inputs_declarations_expr = :(local $channel_var)
-        inputs_assignments_expr = :($channel_var = $(clause.channel|>get|>esc))
-        if !isnull(clause.value)
-            inputs_declarations_expr = :($inputs_declarations_expr; local $value_var)
-            inputs_assignments_expr = :($inputs_assignments_expr;
-                                        $value_var = $(clause.value|>get|>esc))
-        end
+        value_var = clause.value|>get|>esc
+        channel_declaration_expr = :(local $channel_var)
+        channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
         if clause.kind == SelectPut
             wait_for_channel = :(wait_put($channel_var))
             mutate_channel =  :(put!($channel_var, $value_var))
             bind_variable = :(nothing)
         elseif clause.kind == SelectTake
+            #@assert get(clause.value) isa Symbol "Syntax error: Channel |> variable clause must assign into a simple variable name."
             wait_for_channel =  :(wait($channel_var))
             mutate_channel =  :(_take!($channel_var))
             bind_variable = :($value_var = branch_val)
         end
         branch = quote
             tasks[$i] = @async begin
-                $inputs_declarations_expr
+                $channel_declaration_expr
                 try  # Listen for genuine errors to throw to the main task
                     try
-                        $inputs_assignments_expr
+                        $channel_assignment_expr
                         # Listen for SelectInterrupt messages so we can shutdown
                         # if a rival's channel unblocks first.
                         $wait_for_channel
                     catch err
+                        @info "CAUGHT SelectInterrupt: $err"
                         if isa(err, SelectInterrupt)
                             yieldto(err.parent)
                             return
@@ -265,6 +269,7 @@ function _select_block_macro(clauses)
                             rethrow()
                         end
                     end
+                    @info "Task $($i) woke: killing rivals"
                     select_kill_rivals(tasks, $i)
                     event_val = $mutate_channel
                     put!(winner_ch, ($i, event_val))
