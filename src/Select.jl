@@ -174,8 +174,6 @@ _isready(t::Task) = istaskdone(t)
 
 _wait_condition(c::AbstractChannel) = c.cond_wait
 _wait_condition(x) = x
-_wait_lock(c::AbstractChannel) = _wait_condition(c)
-_wait_lock(x) = Base.AlwaysLockedST()  # Fake lock just to mesh with the algorithm, because Tasks don't need to coordinate w/ anyone
 
 # helper function to place the default case in the proper position
 function set_default_first!(clauses)
@@ -256,25 +254,25 @@ function _select_block_macro(clauses)
     body_branches = Expr(:block)
     for (i, (clause, body)) in enumerate(clauses)
         channel_var = gensym("channel")
+        clause_lock = gensym("clause_lock")
+        lock_assignment_expr = :($clause_lock = Base.ReentrantLock())
         value_var = clause.value|>get|>esc
         channel_declaration_expr = :(local $channel_var)
         channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
         if clause.kind == SelectPut
             isready_func = isready_put
-            wait_condition = :($channel_var.cond_put)
-            wait_lock = :($channel_var.cond_put)
+            wait_for_channel =  :(wait_put($channel_var))
             mutate_channel =  :(put!($channel_var, $value_var))
             bind_variable = :(nothing)
         elseif clause.kind == SelectTake
-            isready_func = _isready
-            wait_condition = :($_wait_condition($channel_var))
-            wait_lock = :($_wait_lock($channel_var))
+            wait_for_channel =  :(wait($channel_var))
             mutate_channel =  :(_take!($channel_var))
             bind_variable = :($value_var = branch_val)
         end
         branch = quote
             tasks[$i] = @async begin
                 $channel_declaration_expr
+                $lock_assignment_expr
                 try  # Listen for genuine errors to throw to the main task
                     $channel_assignment_expr
 
@@ -283,22 +281,23 @@ function _select_block_macro(clauses)
                     # Listen for SelectInterrupt messages so we can shutdown
                     # if a rival's channel unblocks first.
                     try
-                        #@info "Task $($i) about to lock"
-                        lock($wait_lock)
                         #@info "Task $($i) about to wait"
-                        while !$isready_func($channel_var)
-                            #@info "Task $($i) waiting"
-                            if $channel_var isa AbstractChannel
-                                Base.check_channel_state($channel_var)
-                            end
-                            wait($wait_condition)  # Can be cancelled while waiting here...
+                        $wait_for_channel
+                        # NOTE: This is _not a deadock_ because there is a global ordering
+                        # to the locks: we _ALWAYS_ wait on the channel before waiting on
+                        # the clause_lock. This invariant must not be violated.
+                        #@info "Task $($i) about to lock"
+                        try
+                            lock($clause_lock)
+                            # We got the lock, so run this task to completion.
+                            #@info "Task $($i) woke: killing rivals"
+                            select_kill_rivals(tasks, $i)
+                            event_val = $mutate_channel
+                            #@info "Got event_val: $event_val"
+                            put!(winner_ch, ($i, event_val))
+                        finally
+                            unlock($clause_lock)
                         end
-                        # We got the lock, so run this task to completion.
-                        #@info "Task $($i) woke: killing rivals"
-                        select_kill_rivals(tasks, $i)
-                        event_val = $mutate_channel
-                        #@info "Got event_val: $event_val"
-                        put!(winner_ch, ($i, event_val))
                     catch err
                         #@info "CAUGHT SelectInterrupt: $err"
                         if isa(err, SelectInterrupt)
@@ -307,8 +306,6 @@ function _select_block_macro(clauses)
                         else
                             rethrow()
                         end
-                    finally
-                        unlock($wait_lock)
                     end
                 catch err
                     Base.throwto(maintask, err)
