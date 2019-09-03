@@ -172,6 +172,11 @@ _take!(x) = wait(x)
 _isready(c::AbstractChannel) = isready(c)
 _isready(t::Task) = istaskdone(t)
 
+_wait_condition(c::AbstractChannel) = c.cond_wait
+_wait_condition(x) = x
+_wait_lock(c::AbstractChannel) = _wait_condition(c)
+_wait_lock(x) = Base.AlwaysLockedST()  # Fake lock just to mesh with the algorithm, because Tasks don't need to coordinate w/ anyone
+
 # helper function to place the default case in the proper position
 function set_default_first!(clauses)
     default_pos = findall(clauses) do x
@@ -257,11 +262,13 @@ function _select_block_macro(clauses)
         if clause.kind == SelectPut
             isready_func = isready_put
             wait_condition = :($channel_var.cond_put)
+            wait_lock = :($channel_var.cond_put)
             mutate_channel =  :(put!($channel_var, $value_var))
             bind_variable = :(nothing)
         elseif clause.kind == SelectTake
-            isready_func = Base.isready
-            wait_condition = :($channel_var.cond_wait)
+            isready_func = _isready
+            wait_condition = :($_wait_condition($channel_var))
+            wait_lock = :($_wait_lock($channel_var))
             mutate_channel =  :(_take!($channel_var))
             bind_variable = :($value_var = branch_val)
         end
@@ -277,11 +284,13 @@ function _select_block_macro(clauses)
                     # if a rival's channel unblocks first.
                     try
                         #@info "Task $($i) about to lock"
-                        lock($wait_condition)
+                        lock($wait_lock)
                         #@info "Task $($i) about to wait"
                         while !$isready_func($channel_var)
                             #@info "Task $($i) waiting"
-                            Base.check_channel_state($channel_var)
+                            if $channel_var isa AbstractChannel
+                                Base.check_channel_state($channel_var)
+                            end
                             wait($wait_condition)  # Can be cancelled while waiting here...
                         end
                         # We got the lock, so run this task to completion.
@@ -299,7 +308,7 @@ function _select_block_macro(clauses)
                             rethrow()
                         end
                     finally
-                        unlock($wait_condition)
+                        unlock($wait_lock)
                     end
                 catch err
                     Base.throwto(maintask, err)
