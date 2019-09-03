@@ -5,20 +5,33 @@ using Nullables
 export @select
 
 function isready_put(c::Channel)
-    d = c.take_pos - c.put_pos
-    if (d == 1) || (d == -(c.szp1-1))
-        if (c.szp1 - 1) ≥ c.sz_max
-            return false
-        end
+    return if Base.isbuffered(c)
+        length(c.data) != c.sz_max
+    else
+        !isempty(c.cond_take.waitq)
     end
-    return true
 end
 
 function wait_put(c::Channel)
+    # TODO: This is definitely not safe in the new threaded world
     while !isready_put(c)
         wait(c.cond_put)
     end
 end
+
+# function wait(c::Channel)
+#     isready(c) && return
+#     lock(c)
+#     try
+#         while !isready(c)
+#             check_channel_state(c)
+#             wait(c.cond_wait)
+#         end
+#     finally
+#         unlock(c)
+#     end
+#     nothing
+# end
 
 
 ## Implementation of 'select' mechanism to block on the disjunction of
