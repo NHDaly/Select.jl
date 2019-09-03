@@ -267,55 +267,41 @@ function _select_block_macro(clauses)
                     # Listen for SelectInterrupt messages so we can shutdown
                     # if a rival's channel unblocks first.
                     try
-                        # AHA: This needs to be an outer loop, because of the gap....
-                        # TODO: Describe this better
-                        while true
-                            @info "Task $($i) about to wait"
-                            $wait_for_channel
+                        #@info "Task $($i) about to wait"
+                        $wait_for_channel
 
-                            # TODO: Because of this gap, where no locks are held, it's possible
-                            # that multiple tasks can be woken-up due to a `put!` or `take!` on
-                            # a channel they were waiting for. Only once will proceed in this
-                            # @select, but a channel running _outside this macro_ may yet proceed
-                            # and cause a problem.. I think this is bad. Fix this (probably) by
-                            # returning the lock to unlock from `wait_for_channel`.
+                        # TODO: Because of this gap, where no locks are held, it's possible
+                        # that multiple tasks can be woken-up due to a `put!` or `take!` on
+                        # a channel they were waiting for. Only once will proceed in this
+                        # @select, but a channel running _outside this macro_ may yet proceed
+                        # and cause a problem.. I think this is bad. Fix this (probably) by
+                        # returning the lock to unlock from `wait_for_channel`.
 
-                            # NOTE: This is _not a deadock_ because there is a global ordering
-                            # to the locks: we _ALWAYS_ wait on the channel before waiting on
-                            # the clause_lock. This invariant must not be violated.
-                            @info "Task $($i) about to lock"
-                            lock($clause_lock)
-                            # We got the lock, so run this task to completion.
-                            try
-                                @info "Task $($i): got lock"
-                                # Here's the thing: If we go the lock because one of our
-                                # siblings woke us up, we need to go back to sleep. Siblings
-                                # don't count. So if we got woken up above but we're actually
-                                # still not ready, we need to let go of this lock, and go back
-                                # to sleep.
-                                @info $isready_func($channel_var)
-                                if !$isready_func($channel_var)
-                                    @info "Task $($i) Not ready; Unlocking"
-                                    continue
-                                end
-                                # This block is atomic, so it _shouldn't_ matter whether we kill
-                                # rivals first or mutate_channel first. It only matters if one
-                                # case is accidentally synchronizing w/ another case, which
-                                # should be specifically prohibited (somehow).
-                                # For now, I'm killing rivals first so that at least we'll get
-                                # an exception, rather than a deadlock, if we end up waiting on
-                                # our rival, sibling cases.
-                                @info "Task $($i): killing rivals"
-                                select_kill_rivals(tasks, $i)
+                        # NOTE: This is _not a deadock_ because there is a global ordering
+                        # to the locks: we _ALWAYS_ wait on the channel before waiting on
+                        # the clause_lock. This invariant must not be violated.
+                        #@info "Task $($i) about to lock"
+                        lock($clause_lock)
+                        # We got the lock, so run this task to completion.
+                        try
+                            #@info "Task $($i): got lock"
+                            # This block is atomic, so it _shouldn't_ matter whether we kill
+                            # rivals first or mutate_channel first. It only matters if one
+                            # case is accidentally synchronizing w/ another case, which
+                            # should be specifically prohibited (somehow).
+                            # For now, I'm killing rivals first so that at least we'll get
+                            # an exception, rather than a deadlock, if we end up waiting on
+                            # our rival, sibling cases.
+                            #@info "Task $($i): killing rivals"
+                            select_kill_rivals(tasks, $i)
 
-                                @info "Task $($i): mutating"
-                                event_val = $mutate_channel
-                                @info "Got event_val: $event_val"
-                                put!(winner_ch, ($i, event_val))
-                            finally
-                                #@info "Task $($i)) unlock"
-                                unlock($clause_lock)
-                            end
+                            #@info "Task $($i): mutating"
+                            event_val = $mutate_channel
+                            #@info "Got event_val: $event_val"
+                            put!(winner_ch, ($i, event_val))
+                        finally
+                            #@info "Task $($i)) unlock"
+                            unlock($clause_lock)
                         end
                     catch err
                         if isa(err, SelectInterrupt)
