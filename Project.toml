@@ -1,0 +1,17 @@
+name = "Select"
+uuid = "ac7b3b08-bf78-4e82-aa6e-b038cb67d740"
+authors = ["Nathan Daly <nhdaly@gmail.com>", "Brett Cornell <brett.durcan@gmail.com>",
+           "Jon Malmaud <malmaud@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+Nullables = "4d1e1d77-625e-5b40-9113-a560ec7a8ecd"
+
+[compat]
+julia = "1.3"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
