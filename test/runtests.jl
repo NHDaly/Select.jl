@@ -2,12 +2,23 @@ using Select
 using Test
 
 @testset "self-references" begin
-    ch = Channel()
-    @test Select.@select begin
-        ch <| "hi"          => "put"
-        ch |> x             => "take! |> $x"
-        @async(sleep(1))    => "timeout"
-    end == "timeout"
+    # Test multiple times because the deadlock was only triggered if Task 1 is run before
+    # Task 2 or Task 3. Running it multiple times will hopefully cover all the cases.
+    for _ in 1:10
+        # Test that the two clauses in `@select` can't trigger eachother (Here, the problem
+        # would be if Task 1 puts into ch, then Task 2 sees Task 1 waiting, and thinks ch is
+        # ready to take! and attempts to incorrectly proceed w/ the take!.) Instead, this should
+        # timeout, since no one else is putting or taking on `ch`.
+        ch = Channel()
+        @test @select(begin
+            ch <| "hi"          => "put"
+            # This take!(ch) should not be triggered by the put
+            ch |> x             => "take! |> $x"
+            # This wait(ch) should also not be triggered by the put
+            ch                  => "waiting on ch"
+            @async(sleep(0.3))  => "timeout"
+        end) == "timeout"
+    end
 end
 
 function select_block_test(t1, t2, t3, t4)
