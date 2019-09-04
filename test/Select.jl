@@ -45,6 +45,22 @@ end
     @test select_block_test(1, 1, 1, .5) == "Task finished with task_done"
 end
 
+@testset "@select blocking, already ready" begin
+    ch = Channel(1)
+    put!(ch, 1)
+    @test (@select begin
+        ch |> x             => x
+        @async(sleep(0.3))  => "timeout"
+    end) == 1
+
+    # Can immediately put into a buffered channel
+    ch = Channel(1)
+    @test (@select begin
+        ch <| 1             => take!(ch)
+        @async(sleep(0.3))  => "timeout"
+    end) == 1
+end
+
 function select_nonblock_test(test)
     c = Channel(1)
     c2 = Channel(1)
