@@ -4,8 +4,13 @@ os:
   - linux
   - osx
 julia:
-  - release
+  - 1.3
   - nightly
+env:
+  - JULIA_NUM_THREADS=1
+  - JULIA_NUM_THREADS=6
+
+
 notifications:
   email: false
 # uncomment the following lines to override the default test script

@@ -1,12 +1,17 @@
 # Select
 
+This repo is branched from https://github.com/durcan/Select.jl, which was originally a copy of [Jon Malmaud's](https://github.com/malmaud) go-inspired select macro for the Julia programming language. I have updated the repo for Julia 1.3+, multithreaded the Select macro, and hardened the code a bit.
+
+Install this package via:
+```julia
+julia> Pkg.add("https://github.com/NHDaly/Select.jl")
+```
+
+The original README from [durcan/Select.jl](https://github.com/durcan/Select.jl) follows:
+
+-----------------------------------------------------
+
 This is copy of [Jon Malmaud's](https://github.com/malmaud) go inspired select macro for the Julia programming language. I have made a slight syntax modification, but essentially all the code is his.
-
-This packege is currently not registered and can be installed with:
-
-```
-Pkg.clone("https://github.com/durcan/Select.jl.git")
-```
 
 
 A select expression is for waiting on multiple communication operations and is of the form:

@@ -1,23 +1,62 @@
 module Select
 
+using Nullables
+
 export @select
 
-function isready_put(c::Channel)
-    d = c.take_pos - c.put_pos
-    if (d == 1) || (d == -(c.szp1-1))
-        if (c.szp1 - 1) ≥ c.sz_max
-            return false
+function isready_put(c::Channel, sibling_tasks)
+    # TODO: To fix the circular dependency, I think it might be enough to just add a check
+    # here that there is at least one ready task that _isn't_ one of our siblings! We can
+    # take another argument to this function, which is the list of tasks, and cross-reference it?
+    return if Base.isbuffered(c)
+        length(c.data) != c.sz_max
+    else
+        # TODO: No this isn't enough. I need to do it for the _wait_ function, not the wait_put. :'(
+        #@info sibling_tasks
+        #@info "isready_put:" (!isempty(c.cond_take.waitq))#, collect(c.cond_take.waitq))
+        !isempty(c.cond_take.waitq) && any(t->!in(t, sibling_tasks), c.cond_take.waitq)
+    end
+end
+
+function wait_put(c::Channel, sibling_tasks)
+    #isready_put(c, sibling_tasks) && return
+    # TODO: Is this sufficiently thread-safe?
+    lock(c)
+    try
+        while !isready_put(c, sibling_tasks)
+            Base.check_channel_state(c)
+            wait(c.cond_put)  # Can be cancelled while waiting here...
         end
+    finally
+        unlock(c)
     end
-    return true
+    nothing
 end
 
-function wait_put(c::Channel)
-    while !isready_put(c)
-        wait(c.cond_put)
+isready_wait_nosibs(c::Channel, sibling_tasks) = n_avail_nosibs(c, sibling_tasks) > 0
+function n_avail_nosibs(c::Channel, sibling_tasks)
+    if Base.isbuffered(c)
+        length(c.data)
+    else
+        #@info "isready_wait_nosibs:" (isempty(c.cond_put.waitq), collect(c.cond_put.waitq))
+        length(filter(t->0==count(x->x==t, sibling_tasks), collect(c.cond_put.waitq)))
     end
 end
-
+function wait_nosibs(c::Channel, sibling_tasks)
+    # I don't understand why its okay to access this outside the lock...?
+    #isready_wait_nosibs(c, sibling_tasks) && return
+    lock(c)
+    try
+        while !isready_wait_nosibs(c, sibling_tasks)
+            Base.check_channel_state(c)
+            wait(c.cond_wait)
+        end
+    finally
+        unlock(c)
+    end
+    nothing
+end
+wait_nosibs(x, sibling_tasks) = wait(x)
 
 ## Implementation of 'select' mechanism to block on the disjunction of
 ## of 'waitable' objects.
@@ -30,7 +69,7 @@ end
 #    println(value)
 # ...
 # end
-immutable SelectClause{ChannelT, ValueT}
+struct SelectClause{ChannelT, ValueT}
     kind::SelectClauseKind
     channel::Nullable{ChannelT}
     value::Nullable{ValueT}
@@ -116,14 +155,14 @@ macro select(expr)
         # skip line nodes
         isa(se, Expr) || continue
         # grab all the pairs
-        if se.head == :(=>)
-            if se.args[1] != :_
-                push!(clauses, (parse_select_clause(se.args[1]), se.args[2]))
+        if se.head == :call && se.args[1] == :(=>)
+            if se.args[2] != :_
+                push!(clauses, (parse_select_clause(se.args[2]), se.args[3]))
             else
                 # The defaule case (_). If present, the select
                 # statement is considered non-blocking and will return this
                 # section if none of the other conditions are immediately available.
-                push!(clauses, (SelectClause(SelectDefault, Nullable(), Nullable()), se.args[2]))
+                push!(clauses, (SelectClause(SelectDefault, Nullable(), Nullable()), se.args[3]))
                 mode = :nonblocking
             end
         elseif se.head != :block && se.head != :line
@@ -141,7 +180,7 @@ end
 # with select.
 # @select if x |> value  ... will ultimately insert an expression value=_take!(x).
 _take!(c::AbstractChannel) = take!(c)
-_take!(x) = wait(x)
+_take!(x) = fetch(x)
 # @select if x <| value .... will ultimately inset value=put!(x), which currently
 # is only meanginful for channels and so no underscore varirant is used here.
 # These are used with the non-blocking variant of select, which will
@@ -150,9 +189,12 @@ _take!(x) = wait(x)
 _isready(c::AbstractChannel) = isready(c)
 _isready(t::Task) = istaskdone(t)
 
+_wait_condition(c::AbstractChannel) = c.cond_wait
+_wait_condition(x) = x
+
 # helper function to place the default case in the proper position
 function set_default_first!(clauses)
-    default_pos = find(clauses) do x
+    default_pos = findall(clauses) do x
         clause, body = x
         clause.kind == SelectDefault
     end
@@ -170,13 +212,17 @@ function _select_nonblock_macro(clauses)
     for (clause, body) in clauses
         branch =
         if clause.kind == SelectPut
-            :(if isready_put($(clause.channel|>get|>esc))
-                put!($(clause.channel|>get|>esc), $(clause.value|>get|>esc))
+            channel_var = gensym("channel")
+            channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
+            :(if ($channel_assignment_expr; isready_put($channel_var, []))
+                put!($channel_var, $(clause.value|>get|>esc))
                 $(esc(body))
             end)
         elseif clause.kind == SelectTake
-            :(if _isready($(clause.channel|>get|>esc))
-                $(clause.value|>get|>esc) = _take!($(clause.channel|>get|>esc))
+            channel_var = gensym("channel")
+            channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
+            :(if ($channel_assignment_expr; _isready($channel_var))
+                $(clause.value|>get|>esc) = _take!($channel_var)
                 $(esc(body))
             end)
         elseif clause.kind == SelectDefault
@@ -195,58 +241,108 @@ end
 # the first available, it sends a special interrupt to its rivals to kill them.
 # The interrupt includes the task where control should be resumed
 # once the rival has shut itself down.
-immutable SelectInterrupt <: Exception
+struct SelectInterrupt <: Exception
     parent::Task
 end
 # Kill all tasks in "tasks" besides  a given task. Used for killing the rivals
 # of the winning waiting task.
 function select_kill_rivals(tasks, myidx)
+    #@info myidx
     for (taskidx, task) in enumerate(tasks)
         taskidx == myidx && continue
-        if task.state==:waiting
+        #@info taskidx, task
+        #if task.state == :waiting || task.state == :queued
             # Rival is blocked waiting for its channel; send it a message that it's
             # lost the race.
-            Base.throwto(task, SelectInterrupt(current_task()))
-        elseif task.state==:queued
-            # Rival hasn't starting running yet and so hasn't blocked or set up
-            # a try-catch block to listen for SelectInterrupt.
-            # Just delete it from the workqueue.
-            queueidx = findfirst(Base.Workqueue.==task)
-            deleteat!(Base.Workqueue, queueidx)
-        end
+            Base.schedule(task, SelectInterrupt(current_task()), error=true)
+        # TODO: Is this still a legit optimization?:
+        # elseif task.state==:queued
+        #     # Rival hasn't starting running yet and so hasn't blocked or set up
+        #     # a try-catch block to listen for SelectInterrupt.
+        #     # Just delete it from the workqueue.
+        #     queueidx = findfirst(Base.Workqueue.==task)
+        #     deleteat!(Base.Workqueue, queueidx)
+        # end
     end
+    #@info "done killing"
 end
 function _select_block_macro(clauses)
     branches = Expr(:block)
     body_branches = Expr(:block)
+    clause_lock = gensym("clause_lock")
+    lock_assignment_expr = :($clause_lock = Base.ReentrantLock())
     for (i, (clause, body)) in enumerate(clauses)
+        channel_var = gensym("channel")
+        value_var = clause.value|>get|>esc
+        channel_declaration_expr = :(local $channel_var)
+        channel_assignment_expr = :($channel_var = $(clause.channel|>get|>esc))
         if clause.kind == SelectPut
-            wait_for_channel = :(wait_put($(clause.channel|>get|>esc)))
-            mutate_channel =  :(put!($(clause.channel|>get|>esc), $(clause.value|>get|>esc)))
+            isready_func = isready_put
+            wait_for_channel =  :(wait_put($channel_var, tasks))
+            mutate_channel =  :(put!($channel_var, $value_var))
             bind_variable = :(nothing)
         elseif clause.kind == SelectTake
-            wait_for_channel =  :(wait($(clause.channel|>get|>esc)))
-            mutate_channel =  :(_take!($(clause.channel|>get|>esc)))
-            bind_variable = :($(clause.value|>get|>esc) = branch_val)
+            isready_func = _isready
+            wait_for_channel =  :(wait_nosibs($channel_var, tasks))
+            mutate_channel =  :(_take!($channel_var))
+            bind_variable = :($value_var = branch_val)
         end
         branch = quote
-            tasks[$i] = @schedule begin
+            tasks[$i] = @async begin
+                $channel_declaration_expr
                 try  # Listen for genuine errors to throw to the main task
+                    $channel_assignment_expr
+
+                    # ---- Begin the actual `wait_and_select` algorithm ----
+                    # TODO: Is this sufficiently thread-safe?
+                    # Listen for SelectInterrupt messages so we can shutdown
+                    # if a rival's channel unblocks first.
                     try
-                        # Listen for SelectInterrupt messages so we can shutdown
-                        # if a rival's channel unblocks first.
+                        #@info "Task $($i) about to wait"
                         $wait_for_channel
+
+                        # TODO: Because of this gap, where no locks are held, it's possible
+                        # that multiple tasks can be woken-up due to a `put!` or `take!` on
+                        # a channel they were waiting for. Only once will proceed in this
+                        # @select, but a channel running _outside this macro_ may yet proceed
+                        # and cause a problem.. I think this is bad. Fix this (probably) by
+                        # returning the lock to unlock from `wait_for_channel`.
+
+                        # NOTE: This is _not a deadock_ because there is a global ordering
+                        # to the locks: we _ALWAYS_ wait on the channel before waiting on
+                        # the clause_lock. This invariant must not be violated.
+                        #@info "Task $($i) about to lock"
+                        lock($clause_lock)
+                        # We got the lock, so run this task to completion.
+                        try
+                            #@info "Task $($i): got lock"
+                            # This block is atomic, so it _shouldn't_ matter whether we kill
+                            # rivals first or mutate_channel first. It only matters if one
+                            # case is accidentally synchronizing w/ another case, which
+                            # should be specifically prohibited (somehow).
+                            # For now, I'm killing rivals first so that at least we'll get
+                            # an exception, rather than a deadlock, if we end up waiting on
+                            # our rival, sibling cases.
+                            #@info "Task $($i): killing rivals"
+                            select_kill_rivals(tasks, $i)
+
+                            #@info "Task $($i): mutating"
+                            event_val = $mutate_channel
+                            #@info "Got event_val: $event_val"
+                            put!(winner_ch, ($i, event_val))
+                        finally
+                            #@info "Task $($i)) unlock"
+                            unlock($clause_lock)
+                        end
                     catch err
                         if isa(err, SelectInterrupt)
-                            yieldto(err.parent)
+                            #@info "CAUGHT SelectInterrupt: $err"
+                            #yieldto(err.parent)  # TODO: is this still a thing we should do?
                             return
                         else
                             rethrow()
                         end
                     end
-                    select_kill_rivals(tasks, $i)
-                    event_val = $mutate_channel
-                    put!(winner_ch, ($i, event_val))
                 catch err
                     Base.throwto(maintask, err)
                 end
@@ -261,8 +357,9 @@ function _select_block_macro(clauses)
     end
     quote
         winner_ch = Channel(1)
-        tasks = Array(Task, $(length(clauses)))
+        tasks = Array{Task}(undef, $(length(clauses)))
         maintask = current_task()
+        $lock_assignment_expr
         $branches # set up competing tasks
         (branch_id, branch_val) = take!(winner_ch) # get the id of the winning task
         $body_branches # execute the winning block in the original lexical context
@@ -273,7 +370,7 @@ end
 function _select_nonblock(clauses)
     for (i, clause) in enumerate(clauses)
         if clause[1] == :put
-            if isready_put(clause[2])
+            if isready_put(clause[2], [])
                 return (i, put!(clause[2], clause[3]))
             end
         elseif clause[1] == :take
@@ -288,16 +385,16 @@ function _select_nonblock(clauses)
 end
 function _select_block(clauses)
     winner_ch = Channel{Tuple{Int, Any}}(1)
-    tasks = Array(Task, length(clauses))
+    tasks = Array{Task}(undef, length(clauses))
     maintask = current_task()
     for (i, clause) in enumerate(clauses)
-        tasks[i] = @async begin
+        tasks[i] = Threads.@spawn begin
             try
                 try
                     if clause[1] == :put
-                        wait_put(clause[2])
+                        wait_put(clause[2], tasks)
                     elseif clause[1] ==  :take
-                        wait(clause[2])
+                        wait_nosibs(clause[2], tasks)
                     end
                 catch err
                     if isa(err, SelectInterrupt)
