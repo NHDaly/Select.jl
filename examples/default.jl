@@ -1,3 +1,4 @@
+# Translated from the Golang Tour's select intro: https://tour.golang.org/concurrency/6
 module Default
 using Select
 
