@@ -104,3 +104,73 @@ end
         end) == "timeout"
     end
 end
+
+# Other waitable things
+# Conditions
+    # Note that we may not support Base.Condition() because it cannot be used in multithreaded code.
+    ## Simple condition test: wait until a condition is notified
+    #c = Condition()
+    #@async while notify(c) != 1 sleep(0.5) end
+    #@test @select(begin
+    #    c => "c"
+    #end) == "c"
+
+@sync begin
+    c = Threads.Condition()
+    t = @async begin
+        success = false
+        while true
+            lock(c)
+            success = notify(c) > 0
+            unlock(c)
+            if success break; end
+            sleep(0.5)
+        end
+    end
+    lock(c)
+    @test @select(begin
+        c => (unlock(c); "c")
+    end) == "c"
+end
+
+# Multiple waiters
+@sync begin
+    coordinator = Channel()
+
+    c1 = Threads.Condition()
+    c2 = Threads.Condition()
+
+    wait_on_conds() = begin
+        lock(c1)
+        lock(c2)
+        put!(coordinator, 0)
+        @select begin
+            c1  => begin
+                put!(coordinator, 0)
+                unlock(c2); unlock(c1);
+            end
+            c2  => begin
+                put!(coordinator, 0)
+                unlock(c2); unlock(c1);
+            end
+        end
+    end
+    t1 = @async wait_on_conds()
+    t2 = @async wait_on_conds()
+
+    take!(coordinator); take!(coordinator)  # Wait for both tasks to start waiting
+
+    # Now, everyone is waiting, so notifying c1 will wake up _both_ select tasks (and kill both c2 siblings)
+    lock(c1)
+    @test notify(c1) == 2
+    unlock(c1)
+    yield()
+    yield()
+
+    take!(coordinator); take!(coordinator)  # Wait for both tasks to finish running
+
+    # Both select tasks will have killed their sibling clauses, so no one is listening on c2
+    lock(c2)
+    @test notify(c2) == 0
+    unlock(c2)
+end
