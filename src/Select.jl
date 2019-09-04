@@ -14,7 +14,7 @@ function isready_put(c::Channel, sibling_tasks)
         # TODO: No this isn't enough. I need to do it for the _wait_ function, not the wait_put. :'(
         #@info sibling_tasks
         #@info "isready_put:" (!isempty(c.cond_take.waitq))#, collect(c.cond_take.waitq))
-        !isempty(c.cond_take.waitq) && any(t->!occursin(t, sibling_tasks), c.cond_take.waitq)
+        !isempty(c.cond_take.waitq) && any(t->!in(t, sibling_tasks), c.cond_take.waitq)
     end
 end
 
