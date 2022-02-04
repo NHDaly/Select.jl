@@ -2,6 +2,8 @@
 
 **DEPRECATED: This repo was an experiment, but is not maintained, and the code is quite old. See https://github.com/JuliaLang/julia/issues/13763 for a longer discussion on `@select` in Julia.**
 
+----------------------------
+
 This repo is branched from https://github.com/durcan/Select.jl, which was originally a copy of [Jon Malmaud's](https://github.com/malmaud) go-inspired select macro for the Julia programming language. I have updated the repo for Julia 1.3+, multithreaded the Select macro, and hardened the code a bit.
 
 Install this package via:
